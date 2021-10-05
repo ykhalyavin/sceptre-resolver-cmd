@@ -2,44 +2,12 @@
 
 from sceptre.resolvers import Resolver
 import os
+import shlex
 import subprocess
 
 
-def build_expression(args, profile):
-    '''
-    Build the command that will get executed. The expression always contains
-    an AWS profile. By default, the profile that the command is executed with
-    is the one that is used to run sceptre. The user can override that profile
-    by setting an alternate profile in the `profile` parameter.
-    :param args: input arguments
-    :param profile: the AWS profile to execute with
-    :return: the expression to execute
-    '''
-    if not args:
-        raise ValueError("Missing the command to execute")
-
-    if not profile:
-        profile = os.environ.get("AWS_PROFILE")
-
-    expression = args
-    if isinstance(expression, dict):
-        try:
-            expression = args['command']
-            if not expression:
-                raise ValueError("Missing the command to execute")
-        except KeyError:
-            raise KeyError("Missing the command to execute")
-
-        if 'profile' in args:
-            # override default profile
-            profile = args['profile']
-
-    expression = f"AWS_PROFILE={profile} {expression}"
-
-    return expression
-
-
 class SceptreResolverCmd(Resolver):
+    NAME = 'rcmd'
 
     def __init__(self, *args, **kwargs):
         super(SceptreResolverCmd, self).__init__(*args, **kwargs)
@@ -49,9 +17,48 @@ class SceptreResolverCmd(Resolver):
         Executes a command in an environment shell.
         :return: the resulting output from the executed command
         '''
-        expression = build_expression(self.argument, self.stack.profile)
-        shell = os.environ.get('SHELL', '/bin/bash')
-        output = subprocess.check_output([shell, '-c', expression])
-        if isinstance(output, bytes):
-            output = output.decode(os.environ.get('SHELL_ENCODING', 'utf-8'))
-        return output
+        
+        '''
+            command: aws --profile {profile} example --p2 {param2} --p3 {param3}
+            params: 
+              profile: my-legacy-profile
+              param2: !stack_output app/stack.yaml::VAR1_OUTPUT
+              param3: anyvalue
+            environment:
+              AWS_PROFILE: my-profile
+              VAR1: !stack_output app/stack.yaml::VAR1_OUTPUT
+            
+        '''
+        profile = self.stack.profile or os.getenv('AWS_PROFILE')
+        env = os.environ.copy()
+        
+        if isinstance(self.argument, dict):
+            params = self.argument.get('params', {})
+            environment = self.argument.get('environment', {})
+            
+            for opt in 'params', 'environment':
+                for k, v in self.argument.get(opt, {}).items():
+                    if isinstance(v, Resolver):
+                        self.argument[opt][k] = v.resolve()
+                        self.logger.debug('[%s] resolved "%s" to "%s"', 
+                                          self.NAME, k, params[k])                
+                                      
+            env.update(environment)
+            
+            # backward compatibility
+            profile = self.argument.get('profile', profile)
+            
+            # AWS_PROFILE in 'environment' options key should have precedence
+            # over any default choice
+            profile = environment.get('AWS_PROFILE', profile)
+            cmd = self.argument['command'].format(**params)
+        else:
+            cmd = self.argument
+            
+        # backward compatibility
+        env['AWS_PROFILE'] = profile
+        
+        args = shlex.split(cmd)
+        p = subprocess.run(args, env=env, check=True, capture_output=True)
+        
+        return p.stdout.decode(os.getenv('SHELL_ENCODING', 'utf-8'))
